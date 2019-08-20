@@ -111,7 +111,8 @@ def download(url, path, overwrite=False, size_compare=False, verbose=1, retries=
         except Exception as err:
             retries -= 1
             if retries == 0:
-                os.remove(tempfile)
+                if os.path.exists(tempfile):
+                    os.remove(tempfile)
                 raise err
             else:
                 print("download failed due to {}, retrying, {} attempt{} left"
@@ -119,8 +120,8 @@ def download(url, path, overwrite=False, size_compare=False, verbose=1, retries=
 
 
 TEST_DATA_ROOT_PATH = os.path.join(os.path.expanduser('~'), '.tvm_test_data')
-if not os.path.exists(TEST_DATA_ROOT_PATH):
-    os.mkdir(TEST_DATA_ROOT_PATH)
+os.makedirs(TEST_DATA_ROOT_PATH, exist_ok=True)
+
 
 def download_testdata(url, relpath, module=None):
     """Downloads the test data from the internet.

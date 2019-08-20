@@ -151,6 +151,8 @@ def strided_slice(a, begin, end, strides=None):
     -------
     ret : tvm.Tensor
     """
+    if strides is None:
+        strides = []
     return cpp.strided_slice(a, begin, end, strides)
 
 
@@ -263,6 +265,7 @@ def take(a, indices, axis=None, mode="clip"):
         Specifies how out-of-bound indices will behave.
         clip - clip to the range (default)
         wrap - wrap around the indices
+        fast - no clip or wrap around (user must make sure indices are in-bound)
 
     Returns
     -------
@@ -422,7 +425,7 @@ def shape(array, dtype="int32"):
     Parameters
     ----------
     array : tvm.Tensor
-        The source tenosr.
+        The source tensor.
 
     dtype : str, optional
         The target data type.
@@ -433,3 +436,85 @@ def shape(array, dtype="int32"):
         The resulting tensor.
     """
     return cpp.shape(array, dtype)
+
+
+def sequence_mask(data, valid_length, mask_value=0, axis=0):
+    """Sets all elements outside the expected length of the sequence to a constant value.
+
+    This function takes an n-dimensional input array of the form [MAX_LENGTH, batch_size, ...] or
+    [batch_size, MAX_LENGTH, ...] and returns an array of the same shape.
+
+    `axis` means the axis of the length dimension and can only be 0 or 1. If `axis` is 0,
+    the data must have shape [MAX_LENGTH, batch_size, ...]. Otherwise (axis=1), the data must have
+    shape [batch_size, MAX_LENGTH, ...].
+
+    `valid_length` gives the length of each sequence. `valid_length` should be
+    a 1D int array with positive ints and has dimension [batch_size,].
+
+    Parameters
+    ----------
+    data : tvm.Tensor
+        N-D with shape [MAX_LENGTH, batch_size, ...] or [batch_size, MAX_LENGTH, ...]
+        depending on the value of `axis`.
+
+    valid_length : tvm.Tensor
+        1-D with shape [batch_size,]
+
+    mask_value : float, optional
+        The masking value, default 0
+
+    axis : int, optional
+        axis of the length dimension, must be 0 or 1, default 0
+
+    Returns
+    -------
+    output : tvm.Tensor
+        N-D with shape [MAX_LENGTH, batch_size, ...] or [batch_size, MAX_LENGTH, ...]
+        depending on the value of `axis`.
+    """
+
+    assert len(data.shape) >= 2,\
+        "only support data.ndim >= 2, received data.shape = {}".format(data.shape)
+    assert axis == 0 or axis == 1, "only support axis = 0, 1, received axis = {}".format(axis)
+    return cpp.sequence_mask(data, valid_length, mask_value, axis)
+
+
+def ndarray_size(array, dtype="int32"):
+    """Get the number of elements of input array
+
+    Parameters
+    ----------
+    array : tvm.Tensor
+        The source tensor.
+
+    dtype : str, optional
+        The target data type.
+
+    Returns
+    -------
+    result : tvm.Tensor
+        The resulting tensor.
+    """
+    return cpp.ndarray_size(array, dtype)
+
+
+def where(condition, x, y):
+    """Get the elements, either from x or y, depending on the condition.
+
+    Parameters
+    ----------
+    condition : tvm.Tensor
+        The condition array.
+
+    x : tvm.Tensor
+        First array to be selected.
+
+    y : tvm.Tensor
+        Second array to be selected.
+
+    Returns
+    -------
+    result : tvm.Tensor
+        A Tensor selected from x or y depending on condition.
+    """
+    return cpp.where(condition, x, y)

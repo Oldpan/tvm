@@ -14,8 +14,11 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+import attr
 import numpy as np
 import math
+import torch
+import torchvision
 import topi
 import topi.testing
 import tvm
@@ -42,9 +45,11 @@ def get_tvm_output(graph_def, input_data, target, ctx, output_shape=None, output
         shape_dict = {input_names: input_data.shape}
         dtype_dict = {input_names: input_data.dtype}
 
-    sym, params = relay.frontend.from_onnx(graph_def, shape_dict)
+    mod, params = relay.frontend.from_onnx(graph_def, shape_dict)
     with relay.build_config(opt_level=1):
-        graph, lib, params = relay.build(sym, target, params=params)
+        graph, lib, params = relay.build(mod,
+                                         target,
+                                         params=params)
 
     ctx = tvm.cpu(0)
     from tvm.contrib import graph_runtime
@@ -210,6 +215,29 @@ def test_squeeze():
         tvm_out = get_tvm_output(model, x, target, ctx, out_shape, 'float32')
 
     tvm.testing.assert_allclose(out_shape, tvm_out.shape)
+
+def test_flatten():
+
+    in_shape = (1, 3, 4, 4)
+    axis = 1
+    ref_shape = (1, 48)
+
+    flatten_node = helper.make_node("Flatten", ["in"], ["out"], axis = axis)
+
+    graph = helper.make_graph([flatten_node],
+                              "flatten_test",
+                              inputs = [helper.make_tensor_value_info("in",
+                                            TensorProto.FLOAT, list(in_shape))],
+                              outputs = [helper.make_tensor_value_info("out",
+                                            TensorProto.FLOAT, list(ref_shape))])
+
+    model = helper.make_model(graph, producer_name='flatten_test')
+
+    for target, ctx in ctx_list():
+        x = np.random.uniform(size=in_shape).astype('int32')
+        tvm_out = get_tvm_output(model, x, target, ctx, ref_shape, 'float32')
+
+    tvm.testing.assert_allclose(ref_shape, tvm_out.shape)
 
 def test_unsqueeze():
     in_shape = (3, 3)
@@ -394,7 +422,7 @@ def _test_upsample_nearest():
     y = helper.make_node("Upsample", ['in'], ['out'], mode='nearest', scales=[1.0, 1.0, 2.0, 2.0])
 
     in_array = np.random.uniform(size=in_shape).astype(np.float32)
-    out_array = topi.testing.upsampling_python(in_array, scale, "NCHW")
+    out_array = topi.testing.upsampling_python(in_array, (scale, scale), "NCHW")
 
     graph = helper.make_graph([y],
                               'upsample_nearest_test',
@@ -932,6 +960,9 @@ def test_binary_ops():
     verify_binary_ops("Div", x, y, x / y, broadcast=None)
     verify_binary_ops("Div", x, z, x / z, broadcast=True)
     verify_binary_ops("Sum", x, y, x + y, broadcast=None)
+    verify_binary_ops("Greater", x, y, x > y, broadcast=True)
+    verify_binary_ops("Less", x, y, x < y, broadcast=True)
+    verify_binary_ops("Equal", x, y, x == y, broadcast=True)
 
 def test_single_ops():
     in_shape = (1, 2, 3, 3)
@@ -1045,7 +1076,62 @@ def test_LogSoftmax():
                               'LogSoftmax',
                               {'axis': 1})
 
+
+def check_torch_conversion(model, input_size):
+    dummy_input = torch.randn(*input_size)
+    file_name = '{}.onnx'.format(model.__name__)
+    # Set verbose=True for more output
+    torch.onnx.export(model(), dummy_input, file_name, export_params=True, verbose=False)
+    onnx_model = onnx.load(file_name)
+    for target, ctx in ctx_list():
+        input_data = np.random.uniform(size=input_size).astype('int32')
+        c2_out = get_caffe2_output(onnx_model, input_data)
+        tvm_out = get_tvm_output(onnx_model, input_data, target, ctx)
+        tvm.testing.assert_allclose(c2_out, tvm_out)
+
+def test_resnet():
+    check_torch_conversion(torchvision.models.resnet18, (1,3,224,224))
+    # check_torch_conversion(torchvision.models.resnet101, (1,3,224,224))
+
+# def test_alexnet():
+    # Torch's ONNX export does not support the adaptive pooling used by AlexNet?
+    # check_torch_conversion(torchvision.models.alexnet, (1,3,224,224))
+
+# Torch's ONNX export does not support the adaptive pooling used by vgg16?
+# def test_vgg16():
+#     check_torch_conversion(torchvision.models.vgg16, (1,3,224,224))
+
+# TODO(@jroesch): Update Torch + ONNX to support this import.
+# def test_squeezenet():
+#     # Torch's ONNX export does not support the max pooling used by Squezenet
+#     check_torch_conversion(torchvision.models.squeezenet1_0, (1,3,224,224))
+
+def test_densenet():
+    check_torch_conversion(torchvision.models.densenet161, (1,3,224,224))
+
+def test_inception():
+    check_torch_conversion(torchvision.models.inception_v3, (1,3,224,224))
+
+# TODO(@jroesch): Update Torch + ONNX to support this import.
+# def test_googlenet():
+#     check_torch_conversion(torchvision.models.googlenet, (1,3,224,224))
+
+# TODO(@jroesch): Update Torch + ONNX to support this import.
+# def test_shufflenetv2():
+#     check_torch_conversion(torchvision.models.shufflenetv2, (1,3,224,224))
+
+def test_sign():
+    def Sign_x(x):
+        return np.sign(x)
+    _test_onnx_op_elementwise((3, 4, 5, 6),
+                              Sign_x,
+                              {},
+                              'float32',
+                              'Sign',
+                              {})
+
 if __name__ == '__main__':
+    test_flatten()
     test_reshape()
     test_shape()
     test_power()
@@ -1083,3 +1169,7 @@ if __name__ == '__main__':
     test_ParametricSoftplus()
     test_Scale()
     test_LogSoftmax()
+    test_resnet()
+    test_inception()
+    test_densenet()
+    test_sign()

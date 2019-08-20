@@ -87,6 +87,11 @@ Type ConcreteBroadcast(const TensorType& t1,
       oshape.push_back(s2);
     } else if (EqualConstInt(s2, 1)) {
       oshape.push_back(s1);
+    } else if (s1.as<Any>() && EqualConstInt(s2, 1)) {
+      // TODO(@jroesch): we need to come back to this
+      oshape.push_back(s2);
+    } else if (s2.as<Any>() && EqualConstInt(s1, 1)) {
+      oshape.push_back(s1);
     } else {
       RELAY_ERROR(
           "Incompatible broadcast type "
@@ -108,8 +113,8 @@ bool BroadcastRel(const Array<Type>& types,
                   const Attrs& attrs,
                   const TypeReporter& reporter) {
   CHECK_EQ(types.size(), 3);
-  DLOG(INFO) << "In1:" << types[0] << ",In2:" << types[1]
-                  << ",Out:" << types[2] << std::endl;
+  // DLOG(INFO) << "In1:" << types[0] << ",In2:" << types[1]
+  //                 << ",Out:" << types[2] << std::endl;
   if (auto t0 = ToTensorType(types[0])) {
     if (auto t1 = ToTensorType(types[1])) {
       CHECK_EQ(t0->dtype, t1->dtype);
@@ -126,8 +131,8 @@ bool BroadcastCompRel(const Array<Type>& types,
                       const Attrs& attrs,
                       const TypeReporter& reporter) {
   CHECK_EQ(types.size(), 3);
-  DLOG(INFO) << "In1:" << types[0] << ",In2:" << types[1]
-                  << ",Out:" << types[2] << std::endl;
+  // DLOG(INFO) << "In1:" << types[0] << ",In2:" << types[1]
+  //                 << ",Out:" << types[2] << std::endl;
   if (auto t0 = ToTensorType(types[0])) {
     if (auto t1 = ToTensorType(types[1])) {
       CHECK_EQ(t0->dtype, t1->dtype);

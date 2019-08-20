@@ -35,7 +35,8 @@
 #include "topi/tags.h"
 #include "topi/detail/ravel_unravel.h"
 #include "topi/detail/constant_utils.h"
-#include "tvm/tvm.h"
+#include "tvm/operation.h"
+#include "tvm/expr_operator.h"
 #include "tvm/data_layout.h"
 
 namespace topi {
@@ -209,7 +210,8 @@ inline Tensor reshape(const Tensor& x,
   auto x_shape = x->shape;
   return compute(
     newshape, [&](const Array<Var>& indices) {
-      return x(UnravelIndex(RavelIndex(indices, newshape), x_shape));
+      return x(UnravelIndex(RavelIndex(Array<Expr>{indices.begin(), indices.end()}, newshape),
+                            x_shape));
     }, name, tag);
 }
 
@@ -641,6 +643,13 @@ inline Tensor take(const Tensor& a,
           auto idx = tvm::min(tvm::max(0, indices(out_index)), a_size - 1);
           return a(UnravelIndex(idx, a_shape));
         }, name, tag);
+  } else if (mode == "fast") {
+    LOG(WARNING) << "Fast mode segfaults when there are out-of-bounds indices. "
+                    "Make sure input indices are in bound";
+    return compute(
+        out_shape, [&](const Array<Var>& out_index) {
+          return a(UnravelIndex(indices(out_index), a_shape));
+        }, name, tag);
   } else {  // mode == "wrap"
     return compute(
         out_shape, [&](const Array<Var>& out_index) {
@@ -648,6 +657,43 @@ inline Tensor take(const Tensor& a,
           return a(UnravelIndex(idx, a_shape));
         }, name, tag);
   }
+}
+
+
+/*!
+* \brief Mask the out-of-boundary elements of each sequence.
+*
+* \param data The source array.
+* \param valid_length The real length of each sequence.
+* \param mask_value The masking value.
+* \param axis The axis of the temporal dimension of the sequence
+* \param name The name of the operation.
+* \param tag The tag to mark the operation.
+*
+* \return A Tensor whose op member is the sequence_mask operation
+*/
+inline Tensor sequence_mask(const Tensor& data,
+                            const Tensor& valid_length,
+                            double mask_value,
+                            int axis,
+                            std::string name = "T_sequence_mask",
+                            std::string tag = kInjective) {
+  CHECK(axis == 0 || axis == 1) << "axis must be either 0 or 1";
+  CHECK_EQ(valid_length->shape.size(), 1) << "valid_length must have ndim=1, i.e., (batch_size,).";
+  auto length_dim = data->shape[axis];
+  auto batch_dim = data->shape[1 - axis];
+  Array<Expr> out_shape = data->shape;
+  Tensor out = compute(
+      out_shape, [&](const Array<Var>& out_index) {
+        Array<Expr> len_index;
+        auto tid = out_index[axis];
+        auto bid = out_index[1 - axis];
+        len_index.push_back(bid);
+        Expr ret = tvm::if_then_else(tvm::cast(valid_length->dtype, tid) >= valid_length(len_index),
+                                     tvm::make_const(data->dtype, mask_value), data(out_index));
+        return ret;
+      }, name, tag);
+  return out;
 }
 
 /*!
@@ -706,6 +752,25 @@ inline Tensor take(const Tensor& a,
           }
           return a(real_indices);
         }, name, tag);
+  } else if (mode == "fast") {
+    LOG(WARNING) << "Fast mode segfaults when there are out-of-bounds indices. "
+                    "Make sure input indices are in bound";
+    return compute(
+        out_shape, [&](const Array<Var>& out_index) {
+          Array<Expr> indices_position;
+          for (size_t j = axis; j < static_cast<size_t>(axis+indices_len); ++j) {
+            indices_position.push_back(out_index[j]);
+          }
+          Array<Expr> real_indices;
+          for (size_t j = 0; j < static_cast<size_t>(axis); ++j) {
+            real_indices.push_back(out_index[j]);
+          }
+          real_indices.push_back(indices(indices_position));
+          for (size_t j = axis + indices_len; j < out_index.size(); ++j) {
+            real_indices.push_back(out_index[j]);
+          }
+          return a(real_indices);
+        }, name, tag);
   } else {  // mode == "wrap"
     return compute(
         out_shape, [&](const Array<Var>& out_index) {
@@ -742,7 +807,7 @@ inline Tensor where(const Tensor& condition,
                     const Tensor& x,
                     const Tensor& y,
                     std::string name = "T_where",
-                    std::string tag = kInjective) {
+                    std::string tag = kBroadcast) {
   CHECK_EQ(x->shape.size(), y->shape.size())
     << "x and y must have the same shape.Got different number of dimension: "
     << x->shape.size() << " vs " << y->shape.size();
@@ -1154,6 +1219,29 @@ inline Tensor shape(const Tensor& src,
     Expr ret = 0;
     for (int i = 0; i < ndim; ++i) {
       ret = tvm::if_then_else(idx == i, src->shape[i], ret);
+    }
+    return tvm::cast(dtype, ret);
+  }, name, tag);
+}
+
+/*!
+ * \brief Get the size of input tensor.
+ * \param src the input tensor.
+ * \param dtype the type of the elements in the tensor.
+ * \param name output tensor name.
+ * \param tag output tensor tag.
+ * \return Tensor of input shape.
+ */
+inline Tensor ndarray_size(const Tensor& src,
+                           const Type& dtype,
+                           const std::string& name = "ndarray_size",
+                           const std::string& tag = kInjective) {
+  int ndim = static_cast<int>(src->shape.size());
+  Array<Expr> out_ndarray_size = {1};
+  return compute(out_ndarray_size, [&](const Array<Var>& indices) {
+    Expr ret = 1;
+    for (int i = 0; i < ndim; ++i) {
+      ret *= src->shape[i];
     }
     return tvm::cast(dtype, ret);
   }, name, tag);

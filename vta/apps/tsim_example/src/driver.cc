@@ -35,57 +35,100 @@ uint32_t get_half_addr(void *p, bool upper) {
 using vta::dpi::DPIModuleNode;
 using tvm::runtime::Module;
 
-class TestDriver {
+class DPILoader {
  public:
-  TestDriver(Module module)
-      : module_(module) {
-    dpi_ = static_cast<DPIModuleNode*>(
-        module.operator->());
+  ~DPILoader() {
+    dpi_->SimResume();
+    dpi_->SimFinish();
   }
 
-  int Run(uint32_t length, void* inp, void* out) {
-    uint32_t wait_cycles = 100000000;
-    this->Launch(wait_cycles, length, inp, out);
-    this->WaitForCompletion(wait_cycles);
-    dpi_->Finish();
-    return 0;
+  void Init(Module module) {
+    mod_ = module;
+    dpi_ = this->Get();
+    dpi_->SimLaunch();
+    dpi_->SimWait();
+  }
+
+  DPIModuleNode* Get() {
+    return static_cast<DPIModuleNode*>(mod_.operator->());
+  }
+
+  static DPILoader* Global() {
+    static DPILoader inst;
+    return &inst;
+  }
+
+  // TVM module
+  Module mod_;
+  // DPI Module
+  DPIModuleNode* dpi_{nullptr};
+};
+
+class Device {
+ public:
+  Device() {
+    loader_ = DPILoader::Global();
+  }
+
+  uint32_t Run(uint32_t c, uint32_t length, void* inp, void* out) {
+    uint32_t cycles;
+    this->Init();
+    this->Launch(c, length, inp, out);
+    cycles = this->WaitForCompletion();
+    return cycles;
   }
 
  private:
-  void Launch(uint32_t wait_cycles, uint32_t length, void* inp, void* out) {
-    dpi_->Launch(wait_cycles);
-    // write registers
-    dpi_->WriteReg(0x04, length);
-    dpi_->WriteReg(0x08, get_half_addr(inp, false));
-    dpi_->WriteReg(0x0c, get_half_addr(inp, true));
-    dpi_->WriteReg(0x10, get_half_addr(out, false));
-    dpi_->WriteReg(0x14, get_half_addr(out, true));
+  void Init() {
+    dpi_ = loader_->Get();
+    dpi_->SimResume();
+  }
+
+  void Launch(uint32_t c, uint32_t length, void* inp, void* out) {
+    dpi_->WriteReg(0x08, c);
+    dpi_->WriteReg(0x0c, length);
+    dpi_->WriteReg(0x10, get_half_addr(inp, false));
+    dpi_->WriteReg(0x14, get_half_addr(inp, true));
+    dpi_->WriteReg(0x18, get_half_addr(out, false));
+    dpi_->WriteReg(0x1c, get_half_addr(out, true));
     dpi_->WriteReg(0x00, 0x1); // launch
   }
 
-  void WaitForCompletion(uint32_t wait_cycles) {
+  uint32_t WaitForCompletion() {
     uint32_t i, val;
-    for (i = 0; i < wait_cycles; i++) {
+    for (i = 0; i < wait_cycles_; i++) {
       val = dpi_->ReadReg(0x00);
       if (val == 2) break; // finish
     }
+    val = dpi_->ReadReg(0x04);
+    dpi_->SimWait();
+    return val;
   }
 
- private:
-  DPIModuleNode* dpi_;
-  Module module_;
+  // wait cycles
+  uint32_t wait_cycles_{100000000};
+  // DPI loader
+  DPILoader* loader_{nullptr};
+  // DPI Module
+  DPIModuleNode* dpi_{nullptr};
 };
 
 using tvm::runtime::TVMRetValue;
 using tvm::runtime::TVMArgs;
 
+TVM_REGISTER_GLOBAL("tvm.vta.tsim.init")
+.set_body([](TVMArgs args, TVMRetValue* rv) {
+    Module m = args[0];
+    DPILoader::Global()->Init(m);
+  });
+
 TVM_REGISTER_GLOBAL("tvm.vta.driver")
 .set_body([](TVMArgs args, TVMRetValue* rv) {
-    Module dev_mod = args[0];
-    DLTensor* A = args[1];
-    DLTensor* B = args[2];
-    TestDriver dev_(dev_mod);
-    dev_.Run(A->shape[0], A->data, B->data);
+    DLTensor* A = args[0];
+    DLTensor* B = args[1];
+    Device dev_;
+    uint32_t cycles = dev_.Run(static_cast<int>(args[2]), A->shape[0], A->data, B->data);
+    *rv = static_cast<int>(cycles);
   });
 
 }  // namespace driver

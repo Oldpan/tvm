@@ -26,9 +26,10 @@
  *   Fuse necessary ops into a single one.
  */
 #include <tvm/expr_operator.h>
-#include <tvm/relay/pass.h>
+#include <tvm/relay/analysis.h>
 #include <tvm/relay/expr_functor.h>
 #include <tvm/relay/op_attr_types.h>
+#include <tvm/relay/transform.h>
 #include "./pattern_util.h"
 #include "../../common/arena.h"
 
@@ -962,7 +963,22 @@ Expr FuseOps(const Expr& expr, int fuse_opt_level, const Module& module) {
   }
 }
 
-TVM_REGISTER_API("relay._ir_pass.FuseOps")
+namespace transform {
+
+Pass FuseOps(int fuse_opt_level) {
+  runtime::TypedPackedFunc<Function(Function, Module, PassContext)> pass_func =
+    [=](Function f, Module m, PassContext pc) {
+    int opt_level = fuse_opt_level == -1 ? pc->opt_level : fuse_opt_level;
+    return Downcast<Function>(FuseOps(f, opt_level, m));
+  };
+  return CreateFunctionPass(pass_func, 1, "FuseOps",
+                            {ir::StringImm::make("InferType")});
+}
+
+TVM_REGISTER_API("relay._transform.FuseOps")
 .set_body_typed(FuseOps);
+
+}  // namespace transform
+
 }  // namespace relay
 }  // namespace tvm

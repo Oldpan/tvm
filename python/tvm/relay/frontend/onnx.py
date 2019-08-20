@@ -22,8 +22,10 @@ import logging
 import numpy as np
 import tvm
 from ... import nd as _nd
-from .. import ir_pass
+from .. import analysis
+from .. import transform as _transform
 from .. import expr as _expr
+from .. import module as _module
 from .. import op as _op
 from .common import AttrCvt, Renamer
 from .common import get_relay_op, new_var, infer_shape, infer_channels, get_name
@@ -52,6 +54,15 @@ def revert_caffe2_pad(pads):
             'Number of pads must be either 2 or 4.')
     return pads
 
+
+def onnx_storage_order2layout(storage_order):
+    """converter of onnx storage order parameter to tvm storage order format"""
+    if storage_order not in (0, 1):
+        raise tvm.error.OpAttributeInvalid('Mode of storage_order must be either 0 or 1')
+
+    return 'NCHW' if storage_order == 0 else 'NHWC'
+
+
 def dimension_constraint():
     def _dim_check(attrs):
         if len(attrs['kernel_shape']) == 2:
@@ -59,6 +70,7 @@ def dimension_constraint():
         return False
 
     return _dim_check, "Only 2d kernel supported."
+
 
 class OnnxOpConverter(object):
     """ A helper class for holding onnx op converters.
@@ -107,6 +119,7 @@ class Elemwise(OnnxOpConverter):
             axis = int(attr.get('axis', 0))
             inputs[1] = _op.expand_dims(inputs[1], axis=axis, num_newaxis=2)
         return get_relay_op(op_name)(*inputs)
+
 
 class Pool(OnnxOpConverter):
     """ A helper class for pool op converters.
@@ -247,6 +260,7 @@ class Gemm(OnnxOpConverter):
                            inputs[1], units=channels)
         return _op.nn.bias_add(out, _expr.const(beta) * inputs[2])
 
+
 class MatMul(OnnxOpConverter):
     """ Operator converter for MatMul.
     """
@@ -257,9 +271,40 @@ class MatMul(OnnxOpConverter):
         input_1_t = _op.transpose(inputs[1], axes=(1, 0))
         return _op.nn.dense(inputs[0], input_1_t)
 
+
 class MaxPool(Pool):
+    """ Operator converter for MaxPool
+    """
     name = 'max_pool'
 
+    @classmethod
+    def _impl_v8(cls, inputs, attr, params):
+        return AttrCvt(
+            op_name=dimension_picker(cls.name),
+            transforms={
+                'kernel_shape': 'pool_size',
+                'pads': ('padding', (0, 0), revert_caffe2_pad),
+                'storage_order': ('layout', 'NCHW', onnx_storage_order2layout),
+            },
+            # very weird attributes here in onnx, force check
+            ignores=['dilations', 'auto_pad'],
+            # TODO(higumachan): make sure ceil_mode in onnx, and layout?
+            extras={'ceil_mode': False},
+            custom_check=dimension_constraint())(inputs, attr, params)
+
+    @classmethod
+    def _impl_v10(cls, inputs, attr, params):
+        return AttrCvt(
+            op_name=dimension_picker(cls.name),
+            transforms={
+                'kernel_shape': 'pool_size',
+                'pads': ('padding', (0, 0), revert_caffe2_pad),
+                'storage_order': ('layout', 'NCHW', onnx_storage_order2layout),
+                'ceil_mode': 'ceil_mode'
+            },
+            # very weird attributes here in onnx, force check
+            ignores=['dilations', 'auto_pad'],
+            custom_check=dimension_constraint())(inputs, attr, params)
 
 class Mul(Elemwise):
     name = 'multiply'
@@ -335,6 +380,23 @@ class Reciprocal(OnnxOpConverter):
     def _impl_v1(cls, inputs, attr, params):
         return _expr.const(1.0) / inputs[0]
 
+
+class Flatten(OnnxOpConverter):
+    """ Operator converter for Flatten.
+    """
+
+    @classmethod
+    def _impl_v1(cls, inputs, attr, params):
+        axis = attr.get('axis', 1)
+        if axis == 1:
+            out = _op.nn.batch_flatten(inputs[0])
+        else:
+            newshape = [0] * (axis + 1)
+            newshape[axis] = -1
+            out = _op.reshape(inputs[0], list(newshape))
+        return out
+
+
 class Reshape(OnnxOpConverter):
     """ Operator converter for Reshape.
     """
@@ -348,21 +410,27 @@ class Reshape(OnnxOpConverter):
             shape = tuple(params[inputs[1].name_hint].asnumpy())
             out = _op.reshape(inputs[0], shape)
         else:
-            # Try to infer shape by precompute prune if possible.
-            # TODO: good to check inputs to be in params.
-            #       to be enhanced when relay support list_input_names API of NNVM
-            logging.warning("Infering Reshape argument by precompute")
-            func = _expr.Function(ir_pass.free_vars(inputs[1]), inputs[1])
+            data, shape = inputs
+            logging.warning("Constant evaluating Reshape's shape argument, may reduce performance")
+            shape_params = analysis.free_vars(shape)
+            func = _expr.Function(shape_params, shape)
+            mod = _module.Module.from_expr(func)
+            seq = _transform.Sequential([_transform.InferType(),
+                                         _transform.FoldConstant(),
+                                         _transform.FuseOps(0),
+                                         _transform.InferType()])
+            with tvm.relay.PassContext(opt_level=2):
+                mod = seq(mod)
             with tvm.relay.build_config(opt_level=0):
-                graph, lib, params = tvm.relay.build(func, target="llvm", params=params)
-            ctx = tvm.context("llvm", 0)
-            from tvm.contrib import graph_runtime
-            m = graph_runtime.create(graph, lib, ctx)
-            m.set_input(**params)
-            m.run()
-            params_new = m.get_output(0)
-            inputs.pop(1)
-            out = _op.reshape(inputs[0], tuple(params_new.asnumpy().astype('int32').flatten()))
+                ex = tvm.relay.create_executor("debug", mod=mod)
+                inputs = []
+                for sp in shape_params:
+                    if not sp.name_hint in params:
+                        sh = [int(i) for i in sp.type_annotation.shape]
+                        inputs.append(
+                            tvm.nd.array(np.random.rand(*sh).astype('float32')))
+                static_shape = ex.evaluate()(*inputs, **params)
+            out = _op.reshape(data, newshape=tuple(static_shape.asnumpy()))
 
         return out
 
@@ -507,6 +575,7 @@ class Shape(OnnxOpConverter):
 
     @classmethod
     def _impl_v1(cls, inputs, attr, params):
+        # TODO(@jroesch): use shape_of once it has been fixed)
         return _op.shape_of(inputs[0])
 
 class Cast(OnnxOpConverter):
@@ -604,6 +673,23 @@ class Gather(OnnxOpConverter):
         return AttrCvt('take',
                        extras={'axis':axis})(inputs, {})
         #return _op.take(inputs[0], inputs[1], axis)
+
+
+class Greater(OnnxOpConverter):
+    """ Operator logical greater.
+    """
+    @classmethod
+    def _impl_v7(cls, inputs, attr, params):
+        return _op.greater(inputs[0], inputs[1])
+
+
+class Less(OnnxOpConverter):
+    """ Operator logical less than.
+    """
+    @classmethod
+    def _impl_v7(cls, inputs, attr, params):
+        return _op.less(inputs[0], inputs[1])
+
 
 class LRN(OnnxOpConverter):
     """ Operator converter for Local Response Normalization.
@@ -764,6 +850,18 @@ class ConstantFill(OnnxOpConverter):
             shape = shape + attr.pop('extra_shape')
         return _op.full(inputs[0], shape)
 
+class Sign(OnnxOpConverter):
+    """ Operator converter for Sign.
+    """
+    @classmethod
+    def _impl_v1(cls, inputs, attr, params):
+        return _op.sign(inputs[0])
+
+class Equal(Elemwise):
+    """ Operator converter for Equal.
+    """
+    name = 'equal'
+
 # compatible operators that do NOT require any conversion.
 _identity_list = []
 
@@ -819,6 +917,8 @@ def _get_convert_map(opset):
         'Selu': Selu.get_converter(opset),
         'Elu': Elu.get_converter(opset),
         'Exp': Renamer('exp'),
+        'Greater': Greater.get_converter(opset),
+        'Less': Less.get_converter(opset),
         'Log': Renamer('log'),
         'Tanh': Renamer('tanh'),
         'Pow': Renamer('power'),
@@ -850,7 +950,7 @@ def _get_convert_map(opset):
         # 'InstanceNormalization'
         # 'LpNormalization'
         'Dropout': AttrCvt('dropout', {'ratio': 'rate'}, ignores=['is_test']),
-        'Flatten': Renamer('batch_flatten'),
+        'Flatten': Flatten.get_converter(opset),
         'LRN': LRN.get_converter(opset),
 
         # defs/reduction
@@ -876,6 +976,8 @@ def _get_convert_map(opset):
         'Unsqueeze': Unsqueeze.get_converter(opset),
         'Pad': Pad.get_converter(opset),
         'Shape': Shape.get_converter(opset),
+        'Sign': Sign.get_converter(opset),
+        'Equal': Equal.get_converter(opset)
     }
 
 
@@ -898,7 +1000,7 @@ class GraphProto(object):
         self._renames = {}
         self._num_input = 0
         self._num_param = 0
-        self._shape = shape
+        self._shape = shape if shape else {}
         self._dtype = dtype
 
     def from_onnx(self, graph, opset):
@@ -920,8 +1022,9 @@ class GraphProto(object):
 
         Returns
         -------
-        sym : tvm.relay.expr.Function
-            The returned relay function
+        mod : tvm.relay.Module
+            The returned relay module
+
         params : dict
             A dict of name: tvm.nd.array pairs, used as pretrained weights
         """
@@ -930,6 +1033,9 @@ class GraphProto(object):
             if not init_tensor.name.strip():
                 raise ValueError("Tensor's name is required.")
             self._params[init_tensor.name] = self._parse_array(init_tensor)
+            self._nodes[init_tensor.name] = new_var(init_tensor.name,
+                                                    shape=self._params[init_tensor.name].shape,
+                                                    dtype=self._params[init_tensor.name].dtype)
         for i in graph.input:
             # from onnx v0.2, GraphProto.input has type ValueInfoProto,
             #  and the name is 'i.name'
@@ -953,6 +1059,19 @@ class GraphProto(object):
                 else:
                     dtype = d_type
                 self._nodes[i_name] = new_var(i_name, shape=tshape, dtype=dtype)
+        # get list of unsupported ops
+        convert_map = _get_convert_map(opset)
+        unsupported_ops = set()
+        for node in graph.node:
+            op_name = node.op_type
+            if op_name not in convert_map and \
+               op_name != 'Constant' and \
+               op_name not in _identity_list:
+                unsupported_ops.add(op_name)
+        if unsupported_ops:
+            msg = 'The following operators are not supported for frontend ONNX: '
+            msg += ', '.join(unsupported_ops)
+            raise tvm.error.OpNotImplemented(msg)
         # construct nodes, nodes are stored as directed acyclic graph
         for node in graph.node:
             op_name = node.op_type
@@ -961,8 +1080,15 @@ class GraphProto(object):
             if op_name == "Constant":
                 t_proto = self._parse_attr(node.attribute)["value"]
                 self._num_param += 1
-                self._params[node.output[0]] = self._parse_array(t_proto)
-                self._nodes[node.output[0]] = new_var(node.output[0], shape=list(t_proto.dims))
+                # We should convert scalar integers to int32, to normalize.
+                array = self._parse_array(t_proto)
+                if len(array.shape) == 0 and array.dtype == 'int64':
+                    array = _nd.array(array.asnumpy().astype('int32'))
+                self._params[node.output[0]] = array
+                self._nodes[node.output[0]] = new_var(
+                    node.output[0],
+                    shape=list(t_proto.dims),
+                    dtype=array.dtype)
             else:
                 if op_name == "ConstantFill":
                     fill_value = attr.get('value', 0.0)
@@ -994,8 +1120,8 @@ class GraphProto(object):
         # now return the outputs
         outputs = [self._nodes[self._parse_value_proto(i)] for i in graph.output]
         outputs = outputs[0] if len(outputs) == 1 else _expr.Tuple(outputs)
-        func = _expr.Function(ir_pass.free_vars(outputs), outputs)
-        return func, self._params
+        func = _expr.Function(analysis.free_vars(outputs), outputs)
+        return _module.Module.from_expr(func), self._params
 
     def _parse_value_proto(self, value_proto):
         """Parse ValueProto or raw str."""
@@ -1059,7 +1185,7 @@ class GraphProto(object):
                           attrs,
                           opset):
         """Convert ONNX operator into a Relay operator.
-        The converter must specify conversions explicity for incompatible name, and
+        The converter must specify conversions explicitly for incompatible name, and
         apply handlers to operator attributes.
 
         Parameters
@@ -1124,17 +1250,29 @@ def from_onnx(model,
 
     Returns
     -------
-    sym : tvm.relay.expr.Function
-        Compatible relay function
+    mod : tvm.relay.Module
+        The relay module for compilation
 
     params : dict of str to tvm.NDArray
         The parameter dict to be used by relay
     """
+    try:
+        import onnx
+        if hasattr(onnx.checker, 'check_model'):
+            # try use onnx's own model checker before converting any model
+            try:
+                onnx.checker.check_model(model)
+            except onnx.onnx_cpp2py_export.checker.ValidationError as e:
+                import warnings
+                # the checker is a bit violent about errors, so simply print warnings here
+                warnings.warn(str(e))
+    except ImportError:
+        pass
     g = GraphProto(shape, dtype)
     graph = model.graph
     try:
         opset = model.opset_import[0].version if model.opset_import else 1
     except AttributeError:
         opset = 1
-    sym, params = g.from_onnx(graph, opset)
-    return sym, params
+    mod, params = g.from_onnx(graph, opset)
+    return mod, params

@@ -62,6 +62,9 @@ set(USE_VULKAN OFF)
 # Whether enable OpenGL runtime
 set(USE_OPENGL OFF)
 
+# Whether enable MicroTVM runtime
+set(USE_MICRO OFF)
+
 # Whether to enable SGX runtime
 #
 # Possible values for USE_SGX:
@@ -132,9 +135,14 @@ set(USE_SORT ON)
 # Build ANTLR parser for Relay text format
 set(USE_ANTLR OFF)
 
-# Build TSIM for VTA
-set(USE_VTA_TSIM OFF)
-
 # Whether use Relay debug mode
 set(USE_RELAY_DEBUG OFF)
 
+# Whether to build fast VTA simulator driver
+set(USE_VTA_FSIM ON)
+
+# Whether to build cycle-accurate VTA simulator driver
+set(USE_VTA_TSIM ON)
+
+# Whether to build VTA FPGA driver (device side only)
+set(USE_VTA_FPGA OFF)

@@ -19,10 +19,11 @@
 from __future__ import absolute_import
 from . import op as _reg
 from ._reduce import _schedule_reduce
-from .op import schedule_injective, OpPattern
+from .op import OpPattern
 
 schedule_injective = _reg.schedule_injective
 schedule_broadcast = _reg.schedule_injective
+schedule_concatenate = _reg.schedule_concatenate
 
 
 _reg.register_schedule("collapse_sum_like", _schedule_reduce)
@@ -39,6 +40,7 @@ _reg.register_schedule("reverse", schedule_injective)
 _reg.register_schedule("repeat", schedule_broadcast)
 _reg.register_schedule("tile", schedule_broadcast)
 _reg.register_schedule("cast", schedule_injective)
+_reg.register_schedule("reinterpret", schedule_injective)
 _reg.register_schedule("strided_slice", schedule_injective)
 _reg.register_schedule("slice_like", schedule_injective)
 _reg.register_schedule("split", schedule_injective)
@@ -46,9 +48,11 @@ _reg.register_schedule("take", schedule_injective)
 _reg.register_schedule("transpose", schedule_injective)
 _reg.register_schedule("where", schedule_broadcast)
 _reg.register_schedule("stack", schedule_injective)
-_reg.register_schedule("concatenate", schedule_injective)
+_reg.register_schedule("concatenate", schedule_concatenate)
 _reg.register_schedule("_contrib_reverse_reshape", schedule_injective)
 _reg.register_schedule("gather_nd", schedule_injective)
+_reg.register_schedule("sequence_mask", schedule_injective)
+
 
 # layout_transform
 _reg.register_schedule("layout_transform", schedule_injective)

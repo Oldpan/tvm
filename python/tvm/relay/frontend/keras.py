@@ -20,8 +20,9 @@ from __future__ import absolute_import as _abs
 import sys
 import numpy as np
 import tvm
-from .. import ir_pass
+from .. import analysis
 from .. import expr as _expr
+from .. import module as _module
 from .. import op as _op
 from ... import nd as _nd
 from .common import ExprTable, new_var
@@ -114,6 +115,9 @@ def _convert_activation(inexpr, keras_layer, _):
 
 def _convert_advanced_activation(inexpr, keras_layer, etab):
     act_type = type(keras_layer).__name__
+
+    if act_type == 'Softmax':
+        return _op.nn.softmax(inexpr, axis=1)
     if act_type == 'ReLU':
         if keras_layer.max_value:
             return _op.clip(inexpr, a_min=0., a_max=float(keras_layer.max_value))
@@ -159,6 +163,8 @@ def _convert_merge(inexpr, keras_layer, _):
             'Operator {} is not supported in frontend Keras.'.format(merge_type))
     return ret
 
+def _convert_permute(inexpr, keras_layer, _):
+    return _op.transpose(inexpr, axes=(0,) + keras_layer.dims)
 
 def _convert_dense(inexpr, keras_layer, etab):
     weightList = keras_layer.get_weights()
@@ -203,7 +209,6 @@ def _convert_convolution(inexpr, keras_layer, etab):
     else:
         kernel_h, kernel_w, in_channels, n_filters = weightList[0].shape
         weight = weightList[0].transpose([3, 2, 0, 1])
-    dilation = [1, 1]
     if isinstance(keras_layer.dilation_rate, (list, tuple)):
         dilation = [keras_layer.dilation_rate[0], keras_layer.dilation_rate[1]]
     else:
@@ -237,7 +242,7 @@ def _convert_convolution(inexpr, keras_layer, etab):
     else:
         msg = 'Padding with {} is not supported for operator Convolution ' \
               'in frontend Keras.'
-        raise tvm.error.OpAttributeUnimplemented(msg.format(keras_layer.padding))
+        raise tvm.error.OpAttributeUnImplemented(msg.format(keras_layer.padding))
     if is_deconv:
         out = _op.nn.conv2d_transpose(data=inexpr, **params)
     else:
@@ -285,7 +290,7 @@ def _convert_separable_convolution(inexpr, keras_layer, etab):
     else:
         msg = 'Padding with {} is not supported for operator Separable ' \
               'Convolution in frontend Keras.'
-        raise tvm.error.OpAttributeUnimplemented(msg.format(keras_layer.padding))
+        raise tvm.error.OpAttributeUnImplemented(msg.format(keras_layer.padding))
 
     depthconv = _op.nn.conv2d(data=inexpr, **params0)
     # pointwise conv
@@ -574,6 +579,7 @@ def _default_skip(inexpr, keras_layer, _): # pylint: disable=unused-argument
 _convert_map = {
     'Dense'                    : _convert_dense,
     'Activation'               : _convert_activation,
+    'Softmax'                  : _convert_advanced_activation,
     'ReLU'                     : _convert_advanced_activation,
     'LeakyReLU'                : _convert_advanced_activation,
     'PReLU'                    : _convert_advanced_activation,
@@ -620,7 +626,7 @@ _convert_map = {
     'Average'                : _convert_merge,
     'Maximum'                : _convert_merge,
     # 'Dot'                    : _convert_merge,
-    # 'Permute'                : _convert_permute,
+    'Permute'                : _convert_permute,
     # 'Embedding'              : _convert_embedding,
     # 'RepeatVector'           : _convert_repeat_vector,
 
@@ -632,11 +638,15 @@ _convert_map = {
 
 
 def _check_unsupported_layers(model):
+    missing_ops = set()
     for layer in model.layers:
         op_name = type(layer).__name__
         if op_name not in _convert_map:
-            raise tvm.error.OpNotImplemented(
-                'Operator {} is not supported in frontend Keras.'.format(op_name))
+            missing_ops.add(op_name)
+
+    if missing_ops:
+        raise NotImplementedError( \
+            "The following operators are not implemented: {}".format(missing_ops))
 
 
 def keras_op_to_relay(inexpr, keras_layer, outname, etab):
@@ -680,8 +690,8 @@ def from_keras(model, shape=None):
 
     Returns
     -------
-    func : tvm.relay.Function
-        Compatible relay Function.
+    mod : tvm.relay.Module
+        The relay module for compilation.
 
     params : dict of str to tvm.NDArray
         The parameter dict to be used by Relay.
@@ -743,6 +753,6 @@ def from_keras(model, shape=None):
     outexpr = [etab.get_expr(oc[0].name + ":" + str(oc[1]) + ":" + str(oc[2])) \
                for oc in model._output_coordinates]
     outexpr = outexpr[0] if len(outexpr) == 1 else _expr.Tuple(outexpr)
-    func = _expr.Function(ir_pass.free_vars(outexpr), outexpr)
+    func = _expr.Function(analysis.free_vars(outexpr), outexpr)
     params = {k:_nd.array(np.array(v, dtype=np.float32)) for k, v in etab.params.items()}
-    return func, params
+    return _module.Module.from_expr(func), params

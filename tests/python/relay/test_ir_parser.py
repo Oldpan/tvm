@@ -16,19 +16,14 @@
 # under the License.
 import tvm
 from tvm import relay
-from tvm.relay.parser import enabled
-from tvm.relay.ir_pass import alpha_equal
-from nose import SkipTest
+from tvm.relay.analysis import alpha_equal, assert_alpha_equal
 from nose.tools import nottest, raises
 from numpy import isclose
 from typing import Union
 from functools import wraps
-if enabled():
-    raises_parse_error = raises(tvm._ffi.base.TVMError)
-else:
-    raises_parse_error = lambda x: x
+raises_parse_error = raises(tvm._ffi.base.TVMError)
 
-SEMVER = "v0.0.1"
+SEMVER = "v0.0.3"
 
 BINARY_OPS = {
     "*": relay.multiply,
@@ -65,9 +60,20 @@ TYPES = {
     "float16x4",
 }
 
+def roundtrip(expr):
+    x = relay.fromtext(str(expr))
+    assert_alpha_equal(x, expr)
+
+
+def parse_text(code):
+    x = relay.fromtext(SEMVER + "\n" + code)
+    roundtrip(x)
+    return x
+
+
 def parses_as(code, expr):
     # type: (str, relay.Expr) -> bool
-    return alpha_equal(relay.fromtext(SEMVER + "\n" + code), expr)
+    return alpha_equal(parse_text(code), expr)
 
 def get_scalar(x):
     # type: (relay.Constant) -> (Union[float, int, bool])
@@ -83,17 +89,7 @@ Y_ANNO = relay.Var("y", int32)
 
 UNIT = relay.Tuple([])
 
-# decorator to determine if parser is enabled
-def if_parser_enabled(func):
-    # https://stackoverflow.com/q/7727678
-    @wraps(func)
-    def wrapper():
-        if not enabled():
-            raise SkipTest("ANTLR is not installed!")
-        func()
-    return wrapper
 
-@if_parser_enabled
 def test_comments():
     assert parses_as(
         """
@@ -113,46 +109,56 @@ def test_comments():
         UNIT
     )
 
-@if_parser_enabled
+    assert parses_as(
+        """
+        /* This is a block comment!
+           /*Block comment is recursive!*/
+        */
+        ()
+        """,
+        UNIT
+    )
+
+
 def test_int_literal():
-    assert isinstance(relay.fromtext(SEMVER+"1"), relay.Constant)
-    assert isinstance(relay.fromtext(SEMVER+"1").data, tvm.ndarray.NDArray)
+    assert isinstance(parse_text("1"), relay.Constant)
+    assert isinstance(parse_text("1").data, tvm.ndarray.NDArray)
 
-    assert get_scalar(relay.fromtext(SEMVER+"1")) == 1
-    assert get_scalar(relay.fromtext(SEMVER+"10")) == 10
-    assert get_scalar(relay.fromtext(SEMVER+"0")) == 0
-    assert get_scalar(relay.fromtext(SEMVER+"-100")) == -100
-    assert get_scalar(relay.fromtext(SEMVER+"-05")) == -5
+    assert get_scalar(parse_text("1")) == 1
+    assert get_scalar(parse_text("10")) == 10
+    assert get_scalar(parse_text("0")) == 0
+    assert get_scalar(parse_text("-100")) == -100
+    assert get_scalar(parse_text("-05")) == -5
 
-@if_parser_enabled
+
 def test_float_literal():
-    assert get_scalar(relay.fromtext(SEMVER+"1.0")) == 1.0
-    assert isclose(get_scalar(relay.fromtext(SEMVER+"1.56667")), 1.56667)
-    assert get_scalar(relay.fromtext(SEMVER+"0.0")) == 0.0
-    assert get_scalar(relay.fromtext(SEMVER+"-10.0")) == -10.0
+    assert get_scalar(parse_text("1.0f")) == 1.0
+    assert isclose(get_scalar(parse_text("1.56667f")), 1.56667)
+    assert get_scalar(parse_text("0.0f")) == 0.0
+    assert get_scalar(parse_text("-10.0f")) == -10.0
 
     # scientific notation
-    assert isclose(get_scalar(relay.fromtext(SEMVER+"1e-1")), 1e-1)
-    assert get_scalar(relay.fromtext(SEMVER+"1e+1")) == 1e+1
-    assert isclose(get_scalar(relay.fromtext(SEMVER+"1E-1")), 1E-1)
-    assert get_scalar(relay.fromtext(SEMVER+"1E+1")) == 1E+1
-    assert isclose(get_scalar(relay.fromtext(SEMVER+"1.0e-1")), 1.0e-1)
-    assert get_scalar(relay.fromtext(SEMVER+"1.0e+1")) == 1.0e+1
-    assert isclose(get_scalar(relay.fromtext(SEMVER+"1.0E-1")), 1.0E-1)
-    assert get_scalar(relay.fromtext(SEMVER+"1.0E+1")) == 1.0E+1
+    assert isclose(get_scalar(parse_text("1e-1f")), 1e-1)
+    assert get_scalar(parse_text("1e+1f")) == 1e+1
+    assert isclose(get_scalar(parse_text("1E-1f")), 1E-1)
+    assert get_scalar(parse_text("1E+1f")) == 1E+1
+    assert isclose(get_scalar(parse_text("1.0e-1f")), 1.0e-1)
+    assert get_scalar(parse_text("1.0e+1f")) == 1.0e+1
+    assert isclose(get_scalar(parse_text("1.0E-1f")), 1.0E-1)
+    assert get_scalar(parse_text("1.0E+1f")) == 1.0E+1
 
-@if_parser_enabled
+
 def test_bool_literal():
-    assert get_scalar(relay.fromtext(SEMVER+"True")) == True
-    assert get_scalar(relay.fromtext(SEMVER+"False")) == False
+    assert get_scalar(parse_text("True")) == True
+    assert get_scalar(parse_text("False")) == False
 
-@if_parser_enabled
+
 def test_negative():
-    assert isinstance(relay.fromtext(SEMVER+"let %x = 1; -%x").body, relay.Call)
-    assert get_scalar(relay.fromtext(SEMVER+"--10")) == 10
-    assert get_scalar(relay.fromtext(SEMVER+"---10")) == -10
+    assert isinstance(parse_text("let %x = 1; -%x").body, relay.Call)
+    assert get_scalar(parse_text("--10")) == 10
+    assert get_scalar(parse_text("---10")) == -10
 
-@if_parser_enabled
+
 def test_bin_op():
     for bin_op in BINARY_OPS.keys():
         assert parses_as(
@@ -160,41 +166,41 @@ def test_bin_op():
             BINARY_OPS.get(bin_op)(relay.const(1), relay.const(1))
         )
 
-@if_parser_enabled
-def test_parens():
-    assert alpha_equal(relay.fromtext(SEMVER+"1 * 1 + 1"), relay.fromtext(SEMVER+"(1 * 1) + 1"))
-    assert not alpha_equal(relay.fromtext(SEMVER+"1 * 1 + 1"), relay.fromtext(SEMVER+"1 * (1 + 1)"))
 
-@if_parser_enabled
+def test_parens():
+    assert alpha_equal(parse_text("1 * 1 + 1"), parse_text("(1 * 1) + 1"))
+    assert not alpha_equal(parse_text("1 * 1 + 1"), parse_text("1 * (1 + 1)"))
+
+
 def test_op_assoc():
-    assert alpha_equal(relay.fromtext(SEMVER+"1 * 1 + 1 < 1 == 1"), relay.fromtext(SEMVER+"(((1 * 1) + 1) < 1) == 1"))
-    assert alpha_equal(relay.fromtext(SEMVER+"1 == 1 < 1 + 1 * 1"), relay.fromtext(SEMVER+"1 == (1 < (1 + (1 * 1)))"))
+    assert alpha_equal(parse_text("1 * 1 + 1 < 1 == 1"), parse_text("(((1 * 1) + 1) < 1) == 1"))
+    assert alpha_equal(parse_text("1 == 1 < 1 + 1 * 1"), parse_text("1 == (1 < (1 + (1 * 1)))"))
+
 
 @nottest
-@if_parser_enabled
 def test_vars():
     # temp vars won't work b/c they start with a digit
     # # temp var
-    # temp_var = relay.fromtext("%1")
+    # temp_var = parse_text("%1")
     # assert isinstance(temp_var, relay.Var)
     # assert temp_var.name == "1"
 
     # var
-    var = relay.fromtext(SEMVER+"let %foo = (); %foo")
+    var = parse_text("let %foo = (); %foo")
     assert isinstance(var.body, relay.Var)
     assert var.body.name_hint == "foo"
 
     # global var
-    global_var = relay.fromtext(SEMVER+"@foo")
+    global_var = parse_text("@foo")
     assert isinstance(global_var, relay.GlobalVar)
     assert global_var.name_hint == "foo"
 
     # operator id
-    op = relay.fromtext(SEMVER+"foo")
+    op = parse_text("foo")
     assert isinstance(op, relay.Op)
     assert op.name == "foo"
 
-@if_parser_enabled
+
 def test_let():
     assert parses_as(
         "let %x = 1; ()",
@@ -222,10 +228,10 @@ def test_let():
         )
     )
 
-@if_parser_enabled
+
 def test_seq():
     assert parses_as(
-        "(); ()",
+        "();; ()",
         relay.Let(
             _,
             UNIT,
@@ -241,7 +247,7 @@ def test_seq():
         )
     )
 
-@if_parser_enabled
+
 def test_graph():
     assert parses_as(
         "%0 = (); %1 = 1; (%0, %0, %1)",
@@ -253,22 +259,22 @@ def test_graph():
         relay.Tuple([relay.Tuple([]), relay.Tuple([]), relay.const(1)])
     )
 
+
 @raises_parse_error
-@if_parser_enabled
 def test_graph_wrong_order():
-    relay.fromtext(SEMVER+"%1 = (); %1")
+    parse_text("%1 = (); %1")
+
 
 @raises_parse_error
-@if_parser_enabled
 def test_let_global_var():
-    relay.fromtext(SEMVER+"let @x = 1; ()")
+    parse_text("let @x = 1; ()")
+
 
 @raises_parse_error
-@if_parser_enabled
 def test_let_op():
-    relay.fromtext(SEMVER+"let x = 1; ()")
+    parse_text("let x = 1; ()")
 
-@if_parser_enabled
+
 def test_tuple():
     assert parses_as("()", relay.Tuple([]))
 
@@ -278,7 +284,7 @@ def test_tuple():
 
     assert parses_as("(0, 1, 2)", relay.Tuple([relay.const(0), relay.const(1), relay.const(2)]))
 
-@if_parser_enabled
+
 def test_func():
     # 0 args
     assert parses_as(
@@ -330,11 +336,10 @@ def test_func():
         relay.Function([], UNIT, None, None, tvm.make.node("DictAttrs", n=relay.const(5)))
     )
 
+
 # TODO(@jmp): Crashes if %x isn't annnotated.
-@if_parser_enabled
 def test_defn():
-    id_defn = relay.fromtext(
-        SEMVER+
+    id_defn = parse_text(
         """
         def @id(%x: int32) -> int32 {
             %x
@@ -342,10 +347,9 @@ def test_defn():
         """)
     assert isinstance(id_defn, relay.Module)
 
-@if_parser_enabled
+
 def test_recursive_call():
-    id_defn = relay.fromtext(
-        SEMVER+
+    id_defn = parse_text(
         """
         def @id(%x: int32) -> int32 {
             @id(%x)
@@ -353,7 +357,7 @@ def test_recursive_call():
         """)
     assert isinstance(id_defn, relay.Module)
 
-@if_parser_enabled
+
 def test_ifelse():
     assert parses_as(
         """
@@ -370,11 +374,10 @@ def test_ifelse():
         )
     )
 
+
 @raises_parse_error
-@if_parser_enabled
 def test_ifelse_scope():
-    relay.fromtext(
-        SEMVER+
+    parse_text(
         """
         if (True) {
             let %x = ();
@@ -385,7 +388,7 @@ def test_ifelse_scope():
         """
     )
 
-@if_parser_enabled
+
 def test_call():
     # select right function to call: simple ident case
     id_func = relay.Var("id")
@@ -509,7 +512,7 @@ def test_call():
 
 # Types
 
-@if_parser_enabled
+
 def test_incomplete_type():
     assert parses_as(
         "let %_ : _ = (); ()",
@@ -520,17 +523,17 @@ def test_incomplete_type():
         )
     )
 
-@if_parser_enabled
+
 def test_builtin_types():
     for builtin_type in TYPES:
-        relay.fromtext(SEMVER+"let %_ : {} = (); ()".format(builtin_type))
+        parse_text("let %_ : {} = (); ()".format(builtin_type))
+
 
 @nottest
-@if_parser_enabled
 def test_call_type():
     assert False
 
-@if_parser_enabled
+
 def test_tensor_type():
     assert parses_as(
         "let %_ : Tensor[(), float32] = (); ()",
@@ -542,7 +545,7 @@ def test_tensor_type():
     )
 
     assert parses_as(
-        "let %_ : Tensor[(1,), float32] = (); ()",
+        "let %_ : Tensor[(1), float32] = (); ()",
         relay.Let(
             relay.Var("_", relay.TensorType((1,), "float32")),
             UNIT,
@@ -559,7 +562,7 @@ def test_tensor_type():
         )
     )
 
-@if_parser_enabled
+
 def test_function_type():
     assert parses_as(
         """
@@ -594,7 +597,7 @@ def test_function_type():
         )
     )
 
-@if_parser_enabled
+
 def test_tuple_type():
     assert parses_as(
         """
@@ -628,3 +631,27 @@ def test_tuple_type():
             UNIT
         )
     )
+
+if __name__ == "__main__":
+    test_comments()
+    test_int_literal()
+    test_float_literal()
+    test_bool_literal()
+    test_negative()
+    test_bin_op()
+    test_parens()
+    test_op_assoc()
+    test_let()
+    test_seq()
+    test_graph()
+    test_tuple()
+    test_func()
+    test_defn()
+    test_recursive_call()
+    test_ifelse()
+    test_call()
+    test_incomplete_type()
+    test_builtin_types()
+    test_tensor_type()
+    test_function_type()
+    test_tuple_type()
